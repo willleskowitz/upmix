@@ -59,7 +59,7 @@ Check the `out/` folder for your resulting WAV(s).
 By default, the scripts ensure that Ls, C, Rs do not exceed the original input peak amplitude, preserving relative levels. Adjust if you prefer a different normalization scheme.
 
 ### Real-Time Usage
-While this project currently operates offline, the **long-term goal** is to support real-time workflows. A callback-based approach with smaller buffers (e.g., via `sounddevice` or `PyAudio`) would be a logical next step for achieving real-time upmixing.
+While this project currently operates offline, the **long-term goal** is to support real-time workflows.
 
 ## License
 
