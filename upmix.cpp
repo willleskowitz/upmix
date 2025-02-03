@@ -3,11 +3,12 @@
 // A multi-band upmixing algorithm for Bela with dynamic frequency resolution
 // and robust overlapping STFT processing. This code computes per-band STFT sizes
 // using Python-like logic with a configurable threshold multiplier, applies raised
-// cosine weighting to smooth transitions between bands, and processes each band
-// independently. Designed for production use (PRD).
+// cosine weighting (with a controllable XO fraction, set here to 0.25 to mimic a 
+// fourth order LR crossover) to smooth transitions between bands, and processes each
+// band independently. Designed for production use (PRD).
 //
 // Author: willleskowitz
-// Date: 1/31/2025
+// Date: 2/2/2025
 // -----------------------------------------------------------------------------
 
 #include <Bela.h>
@@ -20,16 +21,16 @@
 //======================================
 // Configurable compile-time limits
 //======================================
-static constexpr unsigned int MAX_STFT_SIZE    = 8192;             // Maximum STFT block size (adjust as needed)
-static constexpr unsigned int RING_BUFFER_SIZE = 2 * MAX_STFT_SIZE; // Size for circular buffer (fixed)
-static constexpr unsigned int MAX_BUFFER_SIZE  = MAX_STFT_SIZE;      // Buffer size used for I/O arrays
+static constexpr unsigned int MAX_STFT_SIZE    = 8192;            // Maximum allowed STFT size
+static constexpr unsigned int MAX_BUFFER_SIZE  = MAX_STFT_SIZE;   // Buffer size used for I/O arrays
 static constexpr float EPS = 1e-12f;                              // Small epsilon to avoid division by zero
-static constexpr float THRESHOLD_MULTI = 16.f;                    // Default threshold multiplier (can be adjusted on the fly)
+static constexpr float THRESHOLD_MULTI = 32.f;                    // Default threshold multiplier
+static constexpr unsigned int RING_BUFFER_SAFETY_MARGIN = 1;      // Safety margin for ring buffer allocation
+static constexpr float XO_FRACTION = 0.25f; 					  // Controls the raised cosine (XO) fraction.
 
 //-------------------------------------
 // Helper: next power of 2
 //-------------------------------------
-// Returns the smallest power of 2 greater than or equal to x.
 static unsigned int nextPowerOf2(unsigned int x)
 {
     unsigned int power = 1;
@@ -41,7 +42,6 @@ static unsigned int nextPowerOf2(unsigned int x)
 //-------------------------------------
 // Helper: map frequency (Hz) to FFT bin
 //-------------------------------------
-// Converts a frequency (Hz) to its corresponding FFT bin number (based on fftSize).
 static unsigned int freqToBin(float freqHz, float sr, unsigned int fftSize)
 {
     float binF = freqHz * fftSize / sr;
@@ -56,7 +56,6 @@ static unsigned int freqToBin(float freqHz, float sr, unsigned int fftSize)
 //-------------------------------------
 // Blackman-Harris Window Generator
 //-------------------------------------
-// Generates a Blackman-Harris window of the given size.
 static void makeBlackmanHarris(float* w, unsigned int size)
 {
     constexpr float a0 = 0.35875f;
@@ -72,26 +71,27 @@ static void makeBlackmanHarris(float* w, unsigned int size)
 }
 
 //--------------------------------------------------------------------------------
-// CircularBuffer Class
+// Dynamic CircularBuffer Class
 //--------------------------------------------------------------------------------
-// A fixed-size circular buffer with a persistent read pointer. Each call to readBlock()
-// advances the read pointer by the specified hopSize.
+// Allocates its internal buffer dynamically based on the actual required size per band.
 class CircularBuffer {
 public:
-    // Sets up the circular buffer with the provided size.
+    CircularBuffer() : buffer_(nullptr), allocatedSize_(0), size_(0), writePos_(0), readPos_(0), fillCount_(0) {}
+    ~CircularBuffer() { delete[] buffer_; }
+    
     void setup(unsigned int size)
     {
-        if(size > RING_BUFFER_SIZE)
-            throw std::runtime_error("Ring size > RING_BUFFER_SIZE");
+        if(buffer_) delete[] buffer_;
+        buffer_ = new float[size];
+        allocatedSize_ = size;
         size_ = size;
         writePos_ = 0;
-        readPos_ = 0; // Initialize the persistent read pointer.
+        readPos_ = 0;
         fillCount_ = 0;
-        for(unsigned int i = 0; i < RING_BUFFER_SIZE; i++){
+        for(unsigned int i = 0; i < size; i++){
             buffer_[i] = 0.f;
         }
     }
-    // Writes an array of samples into the circular buffer.
     void writeSamples(const float* in, unsigned int numSamples)
     {
         for(unsigned int i = 0; i < numSamples; i++){
@@ -100,13 +100,10 @@ public:
         }
         fillCount_ += numSamples;
     }
-    // Returns true if at least 'required' samples are available.
     bool canProcess(unsigned int required) const
     {
         return (fillCount_ >= required);
     }
-    // Reads a block of stftSize samples starting from the current read pointer,
-    // then advances the pointer by hopSize.
     void readBlock(float* out, unsigned int stftSize, unsigned int hopSize)
     {
         if(stftSize > size_)
@@ -122,20 +119,20 @@ public:
             fillCount_ = 0;
     }
 private:
-    float buffer_[RING_BUFFER_SIZE] = {0.f};
-    unsigned int size_ = 0;
+    float* buffer_;
+    unsigned int allocatedSize_;
+    unsigned int size_;
     unsigned int writePos_ = 0;
-    unsigned int readPos_ = 0; // Persistent read pointer.
+    unsigned int readPos_ = 0;
     unsigned int fillCount_ = 0;
 };
 
 //--------------------------------------------------------------------------------
 // OverlapAdd Class
 //--------------------------------------------------------------------------------
-// Implements the overlap-add mechanism for Weighted Overlap–Add (WOLA) synthesis.
+// Implements the overlap-add mechanism for WOLA synthesis.
 class OverlapAdd {
 public:
-    // Initializes the accumulator array to zero.
     void setup(unsigned int size)
     {
         if(size > MAX_STFT_SIZE)
@@ -145,14 +142,12 @@ public:
             accum_[i] = 0.f;
         }
     }
-    // Accumulates a new block (multiplied by the synthesis window) into the accumulator.
     void accumulate(const float* block, const float* window)
     {
         for(unsigned int n = 0; n < size_; n++){
             accum_[n] += block[n] * window[n];
         }
     }
-    // Pops the first hopSize samples (which are fully overlapped) and shifts the accumulator.
     void popHop(unsigned int hopSize, float* out)
     {
         for(unsigned int i = 0; i < hopSize; i++){
@@ -174,15 +169,10 @@ private:
 // Overlap75UpmixBand Class
 //--------------------------------------------------------------------------------
 // Implements one frequency band's upmix processing using 75% overlap (WOLA).
-// It performs:
-// 1. Input reading from a circular buffer.
-// 2. Analysis windowing and FFT computation.
-// 3. Frequency-domain filtering with raised cosine weighting to smooth transitions.
-// 4. Upmix processing (computing left, right, and center components).
-// 5. Inverse FFT and overlap-add reconstruction.
+// It performs: input reading, windowing, FFT, raised cosine filtering,
+// upmix (computing left, right, center), inverse FFT, and overlap-add.
 class Overlap75UpmixBand {
 public:
-    // Sets up the band with hardware block size, sample rate, STFT size, and frequency range.
     void setup(unsigned int hwBlockSize, float sr,
                unsigned int stftSize, float fLow, float fHigh)
     {
@@ -196,9 +186,9 @@ public:
         if(stftSize_ > MAX_STFT_SIZE)
             throw std::runtime_error("stftSize too large");
 
-        // Set raised cosine crossover widths relative to band edge frequencies.
-        xover_width_low_hz = (fLow_ > 0.f) ? fLow_ * 0.25f : 0.f;
-        xover_width_high_hz = (fHigh_ < sr_ * 0.5f) ? fHigh_ * 0.25f : 0.f;
+        // Use global XO_FRACTION to set raised cosine fade widths.
+        xover_width_low_hz = (fLow_ > 0.f) ? fLow_ * XO_FRACTION : 0.f;
+        xover_width_high_hz = (fHigh_ < sr_ * 0.5f) ? fHigh_ * XO_FRACTION : 0.f;
 
         // Initialize FFT objects.
         if(fwdL_.setup(stftSize_) != 0 || invL_.setup(stftSize_) != 0)
@@ -215,9 +205,12 @@ public:
         overlapAddR_.setup(stftSize_);
         overlapAddC_.setup(stftSize_);
 
-        // Setup circular buffers.
-        circBufL_.setup(stftSize_ * 8);
-        circBufR_.setup(stftSize_ * 8);
+        // Compute required ring buffer size based on actual STFT size and number of passes.
+        unsigned int numPasses = static_cast<unsigned int>(std::ceil(static_cast<float>(hwBlockSize_) / 
+                                     (stftSize_ * (1.f - overlap_))));
+        unsigned int ringSize = stftSize_ * (numPasses + RING_BUFFER_SAFETY_MARGIN);
+        circBufL_.setup(ringSize);
+        circBufR_.setup(ringSize);
 
         // Zero temporary arrays.
         for(unsigned int i = 0; i < (MAX_STFT_SIZE / 2 + 1); i++){
@@ -231,24 +224,19 @@ public:
             timeDomainL_[i] = timeDomainR_[i] = timeDomainC_[i] = 0.f;
         }
     }
-    // Feeds input samples into the band’s circular buffers.
     void feed(const float* inL, const float* inR, unsigned int frames)
     {
         circBufL_.writeSamples(inL, frames);
         circBufR_.writeSamples(inR, frames);
     }
-    // Returns true if enough samples have been accumulated to process one full hardware block.
     bool canProcessHwBlock() const
     {
         unsigned int neededPasses = hwBlockSize_ / hopSize_;
         unsigned int neededSamples = stftSize_ * neededPasses;
-        return (circBufL_.canProcess(neededSamples) &&
-                circBufR_.canProcess(neededSamples));
+        return (circBufL_.canProcess(neededSamples) && circBufR_.canProcess(neededSamples));
     }
-    // Processes enough STFT passes to produce exactly one hardware block of output.
     void doOneHwBlock(float* outL, float* outR)
     {
-        // Clear the output buffer.
         for(unsigned int i = 0; i < hwBlockSize_; i++){
             outL[i] = 0.f;
             outR[i] = 0.f;
@@ -256,10 +244,8 @@ public:
         unsigned int numPasses = hwBlockSize_ / hopSize_;
         unsigned int writePos = 0;
         for(unsigned int pass = 0; pass < numPasses; pass++){
-            // Read a block from the circular buffers.
             circBufL_.readBlock(timeDomainL_, stftSize_, hopSize_);
             circBufR_.readBlock(timeDomainR_, stftSize_, hopSize_);
-            // Apply analysis window and perform forward FFT.
             for(unsigned int n = 0; n < stftSize_; n++){
                 fwdL_.td(n) = timeDomainL_[n] * analysisWin_[n];
                 fwdR_.td(n) = timeDomainR_[n] * analysisWin_[n];
@@ -271,11 +257,8 @@ public:
                 reL_[k] = fwdL_.fdr(k);  imL_[k] = fwdL_.fdi(k);
                 reR_[k] = fwdR_.fdr(k);  imR_[k] = fwdR_.fdi(k);
             }
-            // Apply raised cosine weighting to smooth the transitions near band edges.
             applyRaisedCosineFilter(reL_, imL_, reR_, imR_, stftSize_);
-            // Perform the frequency-domain upmix processing.
             doFreqUpmix(nBins);
-            // Inverse FFT for left channel.
             for(unsigned int k = 0; k < nBins; k++){
                 invL_.fdr(k) = reLs_[k];
                 invL_.fdi(k) = imLs_[k];
@@ -284,7 +267,6 @@ public:
             for(unsigned int n = 0; n < stftSize_; n++){
                 timeDomainL_[n] = invL_.td(n);
             }
-            // Inverse FFT for right channel.
             for(unsigned int k = 0; k < nBins; k++){
                 invR_.fdr(k) = reRs_[k];
                 invR_.fdi(k) = imRs_[k];
@@ -293,7 +275,6 @@ public:
             for(unsigned int n = 0; n < stftSize_; n++){
                 timeDomainR_[n] = invR_.td(n);
             }
-            // Inverse FFT for center channel.
             for(unsigned int k = 0; k < nBins; k++){
                 invL_.fdr(k) = reC_[k];
                 invL_.fdi(k) = imC_[k];
@@ -302,7 +283,6 @@ public:
             for(unsigned int n = 0; n < stftSize_; n++){
                 timeDomainC_[n] = invL_.td(n);
             }
-            // Use overlap-add to accumulate the output.
             overlapAddL_.accumulate(timeDomainL_, synthesisWin_);
             overlapAddR_.accumulate(timeDomainR_, synthesisWin_);
             overlapAddC_.accumulate(timeDomainC_, synthesisWin_);
@@ -312,7 +292,6 @@ public:
             overlapAddL_.popHop(hopSize_, chunkL);
             overlapAddR_.popHop(hopSize_, chunkR);
             overlapAddC_.popHop(hopSize_, chunkC);
-            // Combine channels: left = Ls + 0.5 * center; right = Rs + 0.5 * center.
             for(unsigned int i = 0; i < hopSize_; i++){
                 float valL = chunkL[i] + 0.5f * chunkC[i];
                 float valR = chunkR[i] + 0.5f * chunkC[i];
@@ -326,26 +305,23 @@ public:
         }
     }
 private:
-    // Applies a raised cosine filter to FFT bins to smooth transitions at the band edges.
-    // Fade-in is applied at the lower edge if fLow_ > 0, and fade-out at the higher edge if fHigh_ < sr/2.
+    // Applies a raised cosine filter to FFT bins to smooth transitions near band edges.
+    // Fade-in is applied if fLow_ > 0 and fade-out if fHigh_ < sr/2.
     void applyRaisedCosineFilter(float* reL, float* imL, float* reR, float* imR, unsigned int fftSize)
     {
         unsigned int nBins = fftSize / 2 + 1;
-        // Determine bin indices for the frequency range.
         unsigned int binLow = freqToBin(fLow_, sr_, fftSize);
         unsigned int binHigh = freqToBin(fHigh_, sr_, fftSize);
         if(binLow > binHigh)
             std::swap(binLow, binHigh);
         if(binHigh >= nBins)
             binHigh = nBins - 1;
-        // Zero out bins completely outside the desired range.
         for(unsigned int i = 0; i < binLow; i++){
             reL[i] = imL[i] = reR[i] = imR[i] = 0.f;
         }
         for(unsigned int i = binHigh + 1; i < nBins; i++){
             reL[i] = imL[i] = reR[i] = imR[i] = 0.f;
         }
-        // Fade in at the low end.
         if(fLow_ > 0.f && xover_width_low_hz > 0.f) {
             unsigned int fade_bins_low = freqToBin(xover_width_low_hz, sr_, fftSize);
             unsigned int fade_in_start = (binLow > fade_bins_low) ? binLow - fade_bins_low : 0;
@@ -354,7 +330,7 @@ private:
                 for(unsigned int i = 0; i < fade_in_len; i++){
                     unsigned int idx = fade_in_start + i;
                     float x = (i + 0.5f) / fade_in_len;
-                    float alpha = 0.5f * (1.f - cosf(M_PI * x)); // Ramps from 0 to 1.
+                    float alpha = 0.5f * (1.f - cosf(M_PI * x));
                     reL[idx] *= alpha;
                     imL[idx] *= alpha;
                     reR[idx] *= alpha;
@@ -362,7 +338,6 @@ private:
                 }
             }
         }
-        // Fade out at the high end.
         if(fHigh_ < sr_ * 0.5f && xover_width_high_hz > 0.f) {
             unsigned int fade_bins_high = freqToBin(xover_width_high_hz, sr_, fftSize);
             unsigned int fade_out_start = binHigh + 1;
@@ -373,19 +348,18 @@ private:
             for(unsigned int i = 0; i < fade_out_len; i++){
                 unsigned int idx = fade_out_start + i;
                 float x = (i + 0.5f) / fade_out_len;
-                float alpha = 0.5f * (1.f + cosf(M_PI * x)); // Ramps from 1 to 0.
+                float alpha = 0.5f * (1.f + cosf(M_PI * x));
                 reL[idx] *= alpha;
                 imL[idx] *= alpha;
                 reR[idx] *= alpha;
                 imR[idx] *= alpha;
             }
-            // Zero any bins beyond the fade-out region.
             for(unsigned int i = fade_out_end; i < nBins; i++){
                 reL[i] = imL[i] = reR[i] = imR[i] = 0.f;
             }
         }
     }
-    // Performs frequency-domain upmix processing: computes the center, left-side, and right-side components.
+    // Performs frequency-domain upmix processing: computes center, left-side, and right-side.
     void doFreqUpmix(unsigned int nBins)
     {
         for(unsigned int k = 0; k < nBins; k++){
@@ -410,13 +384,13 @@ private:
         }
     }
 private:
-    unsigned int hwBlockSize_ = 0; // Number of frames per hardware block
+    unsigned int hwBlockSize_ = 0; // Frames per hardware block
     float sr_ = 0.f;             // Sample rate
     float fLow_ = 0.f, fHigh_ = 22050.f; // Frequency range for this band
     float overlap_ = 0.75f;      // 75% overlap for WOLA processing
     unsigned int stftSize_ = 0;  // Internal STFT size for this band
     unsigned int hopSize_ = 0;   // Hop size = stftSize * (1 - overlap)
-    // Raised cosine fade widths (in Hz) for the low and high edges.
+    // Raised cosine fade widths (in Hz) for low and high edges.
     float xover_width_low_hz = 0.f;
     float xover_width_high_hz = 0.f;
     // Frequency-domain temporary arrays.
@@ -447,22 +421,21 @@ private:
 // Manages multiple frequency bands. Each band is defined by adjacent band-edge frequencies.
 // The STFT size for each band is computed using Python-like logic with a threshold multiplier:
 //   threshold = (sr * THRESHOLD_MULTI) / f_low, candidate = next_power_of_2(ceil(threshold)),
-// then clamped so that candidate <= hwBlockSize * 4. This ensures that lower frequencies get
-// higher resolution while higher frequencies use smaller blocks. The aggregator feeds the same
-// input to all bands and sums their outputs.
+// then clamped so that candidate <= hwBlockSize * 4.
+// The aggregator feeds the same input to all bands and sums their outputs.
 class MultiBandUpmix {
 public:
-    // Sets the threshold multiplier used in computing the STFT size.
+    // Sets the threshold multiplier (default THRESHOLD_MULTI) used in computing STFT sizes.
     void setThresholdMultiplier(float multiplier)
     {
         thresholdMultiplier_ = multiplier;
     }
     // Sets up the aggregator.
     // Parameters:
-    //   hwBlock: number of frames per hardware block.
-    //   sr: sample rate.
-    //   numBands: number of bands (should equal bandEdges array length - 1).
-    //   bandEdges: array of band-edge frequencies (length = numBands + 1).
+    //   hwBlock: Number of frames per hardware block.
+    //   sr: Sample rate.
+    //   numBands: Number of bands (should equal bandEdges array length - 1).
+    //   bandEdges: Array of band-edge frequencies (length = numBands + 1).
     void setup(unsigned int hwBlock, float sr, unsigned int numBands, const float *bandEdges)
     {
         sr_ = sr;
@@ -507,7 +480,6 @@ public:
             outRight[i] = 0.f;
         }
         float tempL[MAX_BUFFER_SIZE], tempR[MAX_BUFFER_SIZE];
-        // For each band, feed the input and, if ready, process one block and add its output.
         for(unsigned int i = 0; i < numBands_; i++){
             bands_[i].feed(inL, inR, frames);
             if(bands_[i].canProcessHwBlock()){
@@ -538,7 +510,6 @@ private:
     unsigned int numBands_ = 0;
     float sr_ = 0.f;
     unsigned int hwBlockSize_ = 0;
-    // Threshold multiplier (default set to THRESHOLD_MULTI, can be modified via setThresholdMultiplier).
     float thresholdMultiplier_ = THRESHOLD_MULTI;
 };
 
@@ -550,10 +521,9 @@ static MultiBandUpmix gUpmix;
 bool setup(BelaContext* context, void* userData)
 {
     // Example: Use a static array for band edges.
-    // The number of bands is determined dynamically as (array length - 1).
-    float bandEdges[] = {0.f, 1000.0f, 2000.f, 4000.f, context->audioSampleRate * 0.5f};
+    // The number of bands is determined as (array length - 1).
+    float bandEdges[] = {0.f, 500.f, 2000.f, 8000.f, context->audioSampleRate * 0.5f};
     unsigned int numBands = sizeof(bandEdges) / sizeof(bandEdges[0]) - 1;
-    // Optionally adjust the threshold multiplier (if desired).
     gUpmix.setThresholdMultiplier(THRESHOLD_MULTI);
     gUpmix.setup(context->audioFrames, context->audioSampleRate, numBands, bandEdges);
     return true;
@@ -569,7 +539,6 @@ void render(BelaContext* context, void* userData)
         inR[n] = audioRead(context, n, 1);
     }
     float outL[MAX_BUFFER_SIZE], outR[MAX_BUFFER_SIZE];
-    // Process the multi-band upmix.
     gUpmix.process(inL, inR, frames, outL, outR);
     // Write output audio.
     for(unsigned int n = 0; n < frames; n++){
