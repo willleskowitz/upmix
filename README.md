@@ -1,66 +1,102 @@
 # Upmix
 
-**Upmix** is an open-source project focused on prototyping algorithms for stereo localization and transforming conventional two-channel audio into a more immersive, multi-channel experience.
+**Upmix** is an open‐source project dedicated to prototyping algorithms for stereo localization and transforming conventional two‐channel audio into a more immersive, multi‐channel experience.
 
-## Multi-Band Center Extraction and Upmix
+## Multi-Band Left, Center, and Right Extraction
 
-A collection of Python scripts for **STFT-based multi-band audio processing**, particularly aimed at extracting left-side (Ls), center (C), and right-side (Rs) signals from stereo audio. Includes options for parallel (multi-threaded) band processing, flexible crossover definitions, and multiple export modes.
+Upmix provides a collection of tools for STFT-based multi-band audio processing. The project includes two implementations:
 
----
+- **Python Prototype:**  
+  A set of scripts for offline STFT-based multi-band processing that extract left-side (Ls), center (C), and right-side (Rs) signals from stereo audio. It offers flexible crossover definitions, parallel processing, and multiple export modes.
 
-## Contents
+- **C++ Real-Time Program (Bela):**  
+  A real-time implementation optimized for [Bela](https://github.com/BelaPlatform/Bela) (BeagleBone Black). This version uses dynamic frequency resolution, raised cosine smoothing, and efficient memory management to process stereo input in real time and generate upmixed outputs.
 
-- **`main.py`**  
-  - Loads a stereo WAV from the `in/` folder.  
-  - Defines crossover points (`band_edges`) and extracts Ls, C, Rs.  
-  - Depending on `export_mode` (`"AB"`, `"split"`, or `"stereo_sum"`), saves different output WAVs:
-    - **AB**: One 2-channel file (Left = Ls + C + Rs, Right = L + R).
-    - **split**: Three separate stereo files isolating Ls, C, and Rs with panning.
-    - **stereo_sum**: One stereo file with (Left = Ls + C, Right = C + Rs).
+## Key Features
 
-- **`center_extraction.py`**  
-  - Core multi-band STFT logic:
-    - **`chain_bands`**: Creates per-band STFT extractors based on user-specified band edges.  
-    - **`MultiBandExtractorAccu`**: Handles STFT, frequency-domain band limiting/fading, cross-spectral center extraction, and iSTFT with overlap-add.  
-    - **`extract_center_left_right_multi_band_in_memory`**: Runs each band in parallel (via `ThreadPoolExecutor`) and sums partial signals for the final wideband Ls/C/R.
+- **Dynamic Frequency Resolution:**  
+  Computes per-band STFT sizes using the same algorithm as the Python prototype. A configurable threshold multiplier (default set to 32) is used so that lower frequencies receive higher resolution (up to `hwBlockSize * 4`).
 
-- **`filter_design.py`**  
-  - Contains example FIR filter design (approx. 4th-order Linkwitz-Riley) and a helper to apply FIR taps.
-  - Not mandatory for STFT-based extraction, but useful if you explore FIR-based crossovers.
+- **Raised Cosine Smoothing:**  
+  A raised cosine filter is applied near the crossover frequencies to emulate the smooth summing of a fourth-order Linkwitz–Riley (LR) crossover. The fraction used for smoothing is controlled by a global constant (`XO_FRACTION`, default 0.25) that can be adjusted as needed.
 
----
+- **Optimized Memory Management:**  
+  Circular buffers are allocated dynamically based on the actual STFT size and the required number of passes (plus a safety margin), minimizing wasted memory while ensuring all necessary data is available. Other temporary arrays are sized relative to `MAX_STFT_SIZE`, the maximum allowed.
 
-## Installation
+- **Real-Time Efficiency:**  
+  The C++ code is optimized for the single-core BeagleBone Black used by Bela. All processing is performed in C++ with preallocated buffers to avoid runtime memory allocation, keeping latency low.
 
-1. **Clone** this repository or download the source.  
-2. **Install dependencies**:
-   ```bash
-   pip install numpy soundfile scipy
-**Note**: `scipy` is only required if you plan to use `filter_design.py` for FIR creation.
+## How It Works
 
-## Usage
+- **Input:**  
+  The system reads stereo audio in real time from Bela’s audio inputs (or processes a stereo WAV file in the Python prototype).
 
-1. **Place** your stereo WAV file in the `in/` folder.  
-2. **Open** `main.py`:
-   - Change `in_filename` to your WAV’s name.
-   - Adjust `export_mode` to `"AB"`, `"split"`, or `"stereo_sum"`.
-   - Optionally modify `band_edges` to set different crossover frequencies.
-3. **Run**:
-   ```bash
-   python main.py
-Check the `out/` folder for your resulting WAV(s).
+- **Processing:**  
+  The audio is split into multiple frequency bands defined by adjacent crossover frequencies. For each band, an STFT is computed, then processed in the frequency domain—including raised cosine smoothing and center extraction—before being inverted and recombined via overlap-add.
 
-## Notes and Tips
+- **Output:**  
+  The processed signals are routed to Bela’s outputs. In the current configuration, the left channel is computed as:
+  
+  ```cpp
+  float valL = chunkL[i] + 0.5f * chunkC[i];
+  ```
+  and the right channel as:
+  ```cpp
+  float valR = chunkR[i] + 0.5f * chunkC[i];
+  ```
+  This means that the left output consists of the left-side signal plus half the center signal, and the right output is the right-side signal plus half the center signal.  
 
-### Parallel Processing
-`center_extraction.py` uses `ThreadPoolExecutor` for per-band parallelism, potentially speeding up processing on multi-core CPUs.
+  **To route the center (C) signal to a separate output channel (i.e., create a true three-channel system), modify these formulas accordingly in the source code.**
+  
+  ## Installation and Build
+  
+  ### Python Prototype
+  1. **Clone** the repository.
+  2. **Install dependencies.** Note `scipy` is only required for FIR filter design if you use `filter_design.py`.
+     
+     ```bash
+     pip install numpy soundfile scipy
+     ```
+  3. **Create** `in/` and `out/` directories in the repository for storing input and output files.
 
-### Normalization
-By default, the scripts ensure that Ls, C, Rs do not exceed the original input peak amplitude, preserving relative levels. Adjust if you prefer a different normalization scheme.
+  ### C++ Real-Time Program (Bela)
+  
+  1. **Copy** the C++ files (e.g., `upmix.cpp`) into a new project in the Bela IDE.
+  2. **Configure** the project settings as needed. A block size of 2048 and a sample rate of 48 kHz are recommended.
+  3. **Compile and upload** the code to your Bela board. By default, channels 0 and 1 are used for input and output.
 
-### Real-Time Usage
-While this project currently operates offline, the **long-term goal** is to support real-time workflows.
+  ## Usage
+  
+  ### Python Prototype
+  
+  - **Place** your stereo WAV file in the `in/` folder.
+  - **Edit** `main.py` to set your input file, export mode, and crossover frequencies.
+  - **Run:**
+    
+    ```bash
+    python main.py
+    ```
+    Check the `out/` folder for the resulting WAV files.
 
-## License
-
-Licensed under the [Apache License 2.0](LICENSE). See the `LICENSE` file for details.
+  ### C++ Real-Time Program (Bela)
+  
+  - **Adjust** the crossover frequencies and threshold multiplier (if necessary) in the source code.
+  - **Build and upload** the project using the Bela IDE.
+  - The program processes stereo input in real time and outputs the upmixed channels as described above.
+  
+  ## Notes and Tips
+  
+  ### Parallel Processing (Python)
+  - The Python scripts utilize `ThreadPoolExecutor` for parallel band processing, which can accelerate processing on multi-core machines.
+  
+  ### Windowing and Normalization
+  - Both implementations are designed to preserve the overall signal balance relative to the input.
+  - The **Python prototype** employs a fully flexible WOLA framework—with adjustable overlap and window parameters—to achieve near-perfect reconstruction and maintain proper normalization.
+  - In contrast, the **C++ implementation** uses a fixed 75% overlap WOLA approach using Blackman–Harris windows. If further normalization adjustments are required, you can tweak the synthesis window parameters or add additional scaling factors.
+  
+  ### Real-Time Considerations
+  - The C++ code is optimized for a single-core system. Monitor CPU usage and adjust parameters (such as STFT size or number of bands) if required.
+  
+  ## License
+  
+  Licensed under the [Apache License 2.0](LICENSE). See the LICENSE file for details.
