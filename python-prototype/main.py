@@ -8,7 +8,7 @@ This script:
 3) Depending on export_mode, writes one or more WAV files:
    - "AB": 2-channel file (Left = Ls + C + Rs, Right = L + R).
    - "split": three separate stereo files (Ls/C/Rs each isolated).
-   - "stereo_sum": single stereo file (Left = Ls + C, Right = C + Rs).
+   - "stereo_sum": single stereo file (Left = Ls + C/2, Right = Rs + C/2).
 4) Scales Ls, C, and Rs so they do not exceed the original peak amplitude.
 
 Usage:
@@ -141,9 +141,9 @@ def main():
         print(f"[Split] Wrote => {Rs_path} (Left=0, Right=Rs)")
 
     elif export_mode == "stereo_sum":
-        # Single stereo file with (Left = Ls + C, Right = C + Rs)
-        left_ch  = final_left + final_center
-        right_ch = final_center + final_right
+        # Single stereo file with (Left = Ls + C/2, Right = Rs + C/2)
+        left_ch  = final_left + 0.5*final_center
+        right_ch = final_right+ 0.5*final_center 
 
         N = min(len(left_ch), len(right_ch))
         stereo_sum = np.column_stack([left_ch[:N], right_ch[:N]])
@@ -153,8 +153,8 @@ def main():
         sf.write(out_path, stereo_sum, sr)
 
         print(f"[StereoSum] Wrote 2-ch => {out_path}\n"
-              "  Left  = (Ls + C)\n"
-              "  Right = (C + Rs)\n")
+              "  Left  = (Ls + C/2)\n"
+              "  Right = (Rs + C/2)\n")
 
     else:
         print(f"Unknown export_mode '{export_mode}' -- no files written.")
